@@ -1,180 +1,264 @@
-from langgraph.graph import START, END, StateGraph, add_messages
-from typing_extensions import TypedDict
-from langchain_core.tools import tool
-from langchain.chat_models import init_chat_model
-from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.types import interrupt, Command
-from typing import Annotated
-from prompt import linkedin_post_prompt
-from langgraph.checkpoint.memory import MemorySaver
 import uuid
+from typing import Annotated
 from dotenv import load_dotenv
-from ddgs import DDGS
-from langchain_core.messages import ToolMessage
-from linkedln_script import create_linkedin_post
-import json
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from typing_extensions import TypedDict
 
+# Note: The 'duckduckgo-search' library has been renamed to 'ddgs'.
+# It's recommended to 'pip install -U ddgs' and use the new library.
+from ddgs import DDGS
+
+# Local imports from your other files
+from prompt import linkedin_post_prompt
+from linkedin_script import create_linkedin_post
+
+# Load environment variables from .env file
 load_dotenv()
 
 
+# --- State Definition ---
 class State(TypedDict):
-    messages: Annotated[list, add_messages]
-    linkdln_post: str
-    generated_post: Annotated[list[str], add_messages]
-    human_feedback: Annotated[list[str], add_messages]
+    """
+    Represents the state of our graph.
+
+    Attributes:
+        messages: The list of messages that form the conversation history.
+        topic: The initial user-provided topic for the LinkedIn post.
+        generated_post: The latest version of the generated post content.
+        feedback: The latest human feedback provided for revision.
+        ready_to_post: A boolean flag to indicate if the post is approved.
+    """
+
+    messages: Annotated[list[BaseMessage], lambda x, y: x + y]
+    topic: str
+    generated_post: str
+    feedback: str
     ready_to_post: bool
 
+
+# --- Tools ---
 @tool
-def web_search(topic: str):
-    """Takes topic as the input and does websearch and returns the relevant information """
-
-    print(f"Performing web search on {topic}")
-    with DDGS() as ddgs:
-        output = ddgs.text(topic, max_results=5)
-
-    return {"messages":[output]}
-
-def human_feedback_method(state: State):
-    "This takes state as input and takes human feedback for post"
-
-    generated_post = state["generated_post"][-1].content
-    user_feedback = interrupt(generated_post)
-    if user_feedback.lower() == "approve":
-        return Command(
-            update={
-                "human_feedback": state["human_feedback"] + ['approved'],
-                "ready_to_post": True
-            },
-            goto="linkedln"
-        )
-    elif user_feedback.lower() == "done":
-        return Command(
-            update={"human_feedback": state["human_feedback"] + ['finished']},
-            goto=END
-        )
-    else:
-        return Command(
-            update={
-                "human_feedback": state["human_feedback"] + [user_feedback],
-                "ready_to_post": False
-            },
-            goto="chatbot"
-        )
-
-tools=[web_search]
-llm = init_chat_model(model_provider="OpenAI", model="gpt-4o")
-llm_with_tools = llm.bind_tools(tools=tools)
-
-
-def linkedln_post(state: State):
+def web_search(topic: str) -> str:
+    """
+    Takes a topic as input, performs a web search, and returns the top 5 results as a formatted string.
+    This tool is used to gather current information or data for the LinkedIn post.
+    """
+    print(f"---TOOL: Performing web search for topic: '{topic}'---")
     try:
-        if state["ready_to_post"] == True:
-            content = state["generated_post"][-1].content
-            create_linkedin_post(content=content)
-    except Exception as er:
-        return {
-            "message": [f"Got unexpected error {er}"],
-            "linkdln_post": state["linkdln_post"], 
-            "generated_post": state["generated_post"],
-            "human_feedback": state["human_feedback"] + [f"Error: {er}"]
-        }
-    finally:
-        return Command(goto=END)
+        with DDGS() as ddgs:
+            results = ddgs.text(topic, max_results=5)
+            if not results:
+                return "No results found."
+            # Format results into a single, clean string for the LLM
+            formatted_results = "\n\n".join(
+                [f"Title: {r['title']}\nSnippet: {r['body']}" for r in results]
+            )
+            return formatted_results
+    except Exception as e:
+        print(f"Error during web search: {e}")
+        return f"An error occurred during web search: {e}"
 
-def chatbot_router(state: State):
-    """Router function to handle both use cases dynamically"""
-    last_message = state["messages"][-1] if state["messages"] else None
-    
-    # Check if LLM wants to use tools (web search)
-    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-        return "tools"  # Use Case 1: Go to tools first
-    else:
-        return "human"  # Use Case 2: Go directly to human feedback
 
-def human_router(state: State):
-    """Router function to handle human feedback decisions"""
-    last_feedback = state["human_feedback"][-1].content if state["human_feedback"] else ""
-    
-    if last_feedback == "approved":
-        return "linkedln"  # Post to LinkedIn
-    elif last_feedback == "finished":
-        return "__end__"   # End the workflow
-    else:
-        return "chatbot"   # Go back for revision
- 
+# --- Model and Tools Initialization ---
+llm = ChatOpenAI(model="gpt-4o")
+tools = [web_search]
+llm_with_tools = llm.bind_tools(tools)
+tool_node = ToolNode(tools)
 
-def chatbot(state: State)-> State:
-    
-    tool_msgs = [msg for msg in state["messages"] if isinstance(msg, ToolMessage)]
-    if tool_msgs:
-        tool_response_str = tool_msgs[0].content
-    else:
-        tool_response_str = "No data from tool"
-    linkdln_post = state["linkdln_post"]
-    human_feedback = state["human_feedback"][-1].content if state["human_feedback"] else "No feedback yet"
 
-    prompt = linkedin_post_prompt.format(linkdln_post=linkdln_post, web_search_results=tool_response_str, human_feedback=human_feedback)
-    response = llm_with_tools.invoke(prompt)
-    generate_linkdln_post = response if response.content else "No content"
+# --- Graph Nodes ---
+def agent(state: State) -> dict:
+    """
+    The main agent node. It invokes the LLM to either generate a post or decide to use a tool.
+    """
+    print("---AGENT: Generating post or deciding on tool use---")
+    messages = state["messages"]
+    topic = state["topic"]
+    feedback = state["feedback"]
 
+    # Check for tool results in the message history
+    tool_results = "No data from tool yet. Use the web_search tool if you need current information."
+    if messages and isinstance(messages[-1], ToolMessage):
+        tool_results = messages[-1].content
+
+    # Format the prompt for the LLM
+    prompt = linkedin_post_prompt.format(
+        topic=topic, web_search_results=tool_results, feedback=feedback
+    )
+
+    # Create a new HumanMessage for this turn to not pollute the history
+    invocation_messages = messages + [HumanMessage(content=prompt)]
+
+    response = llm_with_tools.invoke(invocation_messages)
+
+    # The agent returns new messages and the generated post content
     return {
-        "messages":[response],
-        "linkdln_post": state["linkdln_post"],
-        "generated_post": [generate_linkdln_post],
-        "human_feedback": [human_feedback]
-
+        "messages": [response],
+        "generated_post": response.content if response.content else "",
     }
 
-tool_node = ToolNode(
-    tools=tools
-)
-graph_builder = StateGraph(State)
-graph_builder.add_node("chatbot", chatbot)
-graph_builder.add_node("human", human_feedback_method)
-graph_builder.add_node("linkedln", linkedln_post)
-graph_builder.add_node("tools", tool_node)
 
-graph_builder.add_edge(START, "chatbot")
-graph_builder.add_conditional_edges("chatbot",chatbot_router)
-graph_builder.add_edge("tools", "chatbot")
-graph_builder.add_conditional_edges("human", human_router)
-graph_builder.add_edge("linkedln", END)
+def human_review(state: State) -> dict:
+    """
+    This node is a placeholder that signals the graph to wait for human input.
+    The graph will be interrupted after this node runs.
+    """
+    print("---HUMAN REVIEW: Awaiting feedback---")
+    # No state change needed here, just a point to pause.
+    return {}
+
+
+def post_to_linkedin(state: State) -> dict:
+    """
+    Posts the final, approved content to LinkedIn.
+    """
+    print("---ACTION: Posting to LinkedIn---")
+    if state.get("ready_to_post"):
+        post_content = state.get("generated_post")
+        if not post_content:
+            print("---ACTION: Failed. No post content found in the state.")
+            return {}
+
+        result = create_linkedin_post(content=post_content)
+        if result.get("success"):
+            print(f"Post successfully published! Post ID: {result.get('post_id')}")
+        else:
+            print(f"Failed to post. Error: {result.get('error')}")
+            print(f"Details: {result.get('details')}")
+    else:
+        print("---ACTION: Skipped posting as post was not approved.---")
+    return {}
+
+
+# --- Conditional Edges (Routers) ---
+def after_human_review(state: State) -> str:
+    """
+    Router that directs the flow after human feedback is received.
+    This runs when the graph is resumed after the interruption.
+    """
+    print("---ROUTER: Processing human feedback---")
+    last_feedback = state.get("feedback", "").lower()
+
+    if "approve" in last_feedback:
+        print("---ROUTER: Feedback is 'approve'. Moving to post.---")
+        return "post"
+    elif "exit" in last_feedback:
+        print("---ROUTER: Feedback is 'exit'. Ending workflow.---")
+        return "end"
+    else:
+        print("---ROUTER: Revision feedback received. Returning to agent.---")
+        return "revise"
+
+
+# --- Graph Definition ---
+graph_builder = StateGraph(State)
+
+graph_builder.add_node("agent", agent)
+graph_builder.add_node("tools", tool_node)
+graph_builder.add_node("human_review", human_review)
+graph_builder.add_node("post_to_linkedin", post_to_linkedin)
+
+graph_builder.set_entry_point("agent")
+
+# This conditional edge checks if the LLM's last response was a tool call.
+# The key "__end__" signifies the default path when no tools are called.
+graph_builder.add_conditional_edges(
+    "agent",
+    tools_condition,
+    {"tools": "tools", "__end__": "human_review"},
+)
+graph_builder.add_edge("tools", "agent")
+
+# This conditional edge routes based on human feedback after the graph resumes.
+graph_builder.add_conditional_edges(
+    "human_review",
+    after_human_review,
+    {"post": "post_to_linkedin", "revise": "agent", "end": END},
+)
+graph_builder.add_edge("post_to_linkedin", END)
+
+# --- Compile and Run ---
+memory = MemorySaver()
+# We interrupt the graph after the 'human_review' node to wait for input.
+graph = graph_builder.compile(checkpointer=memory, interrupt_after=["human_review"])
+
+print("\n--- LinkedIn Post Agent Graph ---")
+print(graph.get_graph().draw_ascii())
+print("---------------------------------\n")
+
 
 def main():
-    graph = graph_builder.compile()
+    """
+    Main function to run the interactive LinkedIn post generation agent.
+    """
+    config = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
-# Print ASCII representation to console
-    print(graph.get_graph().draw_ascii())
-    checkpointer = MemorySaver()
-    graph = graph_builder.compile(checkpointer)
-    thread_config = {"configurable": {
-        "thread_id": uuid.uuid4()
-    }}
-    user_input = input("> ")
-    state = {
-        "messages":[],
-        "linkdln_post": user_input,
-        "generated_post": [],
-        "human_feedback": [],
-        "ready_to_post": False
+    print("Welcome to the LinkedIn Post Generation Agent!")
+    topic = input("What topic would you like to create a post about?\n> ")
+
+    # Initial input to start the graph.
+    initial_input = {
+        "messages": [HumanMessage(content=f"Initial topic: {topic}")],
+        "topic": topic,
+        "feedback": "No feedback yet.",
     }
 
-    for chunk in graph.stream(state, config=thread_config):
-        for node_id, value in chunk.items():
+    while True:
+        # Run the graph. It will execute until it hits the interrupt
+        # or a terminal state (END).
+        result = graph.invoke(initial_input, config=config)
 
-            if node_id == "__interrupt__":
-                while True:
-                    user_feedback = input(f"{chunk['__interrupt__'][0].value} \n\nPlease provide your feedback> ")
-                    graph.invoke(Command(resume=user_feedback), config=thread_config)
+        # The graph is now paused at the 'human_review' node.
+        # The `result` dictionary holds the state at that point.
+        generated_post = result.get("generated_post")
+        if not generated_post:
+            print(
+                "\nAn unexpected error occurred, or the workflow finished prematurely."
+            )
+            break
 
-                    if user_feedback.lower() == "done" or "approve":
-                        break
+        print(f"\n>>>>>> Generated Post <<<<<<\n\n{generated_post}")
+        print("\n---------------------------------")
+        print("Please provide your feedback.")
+        user_feedback = input(
+            "Type 'approve' to post, 'exit' to quit, or provide revision instructions.\n> "
+        )
+
+        if user_feedback.lower() == "exit":
+            print("Exiting workflow.")
+            break
+
+        # **KEY FIX**: To resume correctly, we first update the state of the
+        # paused graph with the new feedback, then we invoke it with `None`
+        # to tell it to continue from where it left off.
+
+        is_approved = "approve" in user_feedback.lower()
+
+        # Update the state of the graph in the checkpointer
+        graph.update_state(
+            config,
+            {"feedback": user_feedback, "ready_to_post": is_approved},
+        )
+
+        # Resume the graph from the interruption point.
+        # We pass `None` as the input because the checkpointer already has the state.
+        initial_input = None
+
+        if is_approved:
+            print("\nPost approved. Resuming to post to LinkedIn...")
+            # This final invoke will resume from the interruption and run to the end.
+            graph.invoke(None, config=config)
+            print("\nWorkflow finished.")
+            break
+
+        # If not approved, the loop continues. The next `graph.invoke` will use
+        # the updated state from the checkpointer to revise the post.
 
 
-main()
-                    
-
-
-
-
-
+if __name__ == "__main__":
+    main()
