@@ -14,8 +14,9 @@ from typing_extensions import TypedDict
 from ddgs import DDGS
 
 # Local imports from your other files
-from prompt import linkedin_post_prompt
+from prompt import linkedin_post_prompt, improve_user_query
 from linkedin_script import create_linkedin_post
+
 
 # Load environment variables from .env file
 load_dotenv()
@@ -65,11 +66,27 @@ def web_search(topic: str) -> str:
 
 
 # --- Model and Tools Initialization ---
-llm = ChatOpenAI(model="gpt-4o")
+main_llm = ChatOpenAI(model="gpt-4o")
+small_llm = ChatOpenAI(model="gpt-4o-mini")
 tools = [web_search]
-llm_with_tools = llm.bind_tools(tools)
+llm_with_tools = main_llm.bind_tools(tools)
 tool_node = ToolNode(tools)
 
+def improve_input(state: State) -> dict:
+    """
+    This method improves the input provide by the user
+    """
+    print("---AGENT: Improving the User Input---")
+    topic = state["topic"]
+    prompt = improve_user_query.format(topic=topic)
+    response = small_llm.invoke(prompt)
+
+    return {
+        "message": HumanMessage(content=response.content),
+        "topic":response.content
+    }
+
+    
 
 # --- Graph Nodes ---
 def agent(state: State) -> dict:
@@ -162,8 +179,10 @@ graph_builder.add_node("agent", agent)
 graph_builder.add_node("tools", tool_node)
 graph_builder.add_node("human_review", human_review)
 graph_builder.add_node("post_to_linkedin", post_to_linkedin)
+graph_builder.add_node("improve_input",improve_input)
 
-graph_builder.set_entry_point("agent")
+graph_builder.set_entry_point("improve_input")
+graph_builder.add_edge("improve_input","agent")
 
 # This conditional edge checks if the LLM's last response was a tool call.
 # The key "__end__" signifies the default path when no tools are called.
@@ -228,6 +247,7 @@ def main():
         user_feedback = input(
             "Type 'approve' to post, 'exit' to quit, or provide revision instructions.\n> "
         )
+
 
         if user_feedback.lower() == "exit":
             print("Exiting workflow.")
