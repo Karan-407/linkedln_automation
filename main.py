@@ -8,13 +8,14 @@ from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from typing_extensions import TypedDict
+import requests
 
 # Note: The 'duckduckgo-search' library has been renamed to 'ddgs'.
 # It's recommended to 'pip install -U ddgs' and use the new library.
 from ddgs import DDGS
 
 # Local imports from your other files
-from prompt import linkedin_post_prompt, improve_user_query
+from prompt import linkedin_post_prompt, improve_user_query, summarize_text_query
 from linkedin_script import create_linkedin_post
 
 
@@ -40,6 +41,7 @@ class State(TypedDict):
     generated_post: str
     feedback: str
     ready_to_post: bool
+    tool_results: str
 
 
 # --- Tools ---
@@ -64,11 +66,28 @@ def web_search(topic: str) -> str:
         print(f"Error during web search: {e}")
         return f"An error occurred during web search: {e}"
 
+@tool
+def fetch_url_data(url: str):
+    """ This methods takes url as the input and returns the content
+    """
+    print(f"---TOOL: Performing get call for url: '{url}'---")
+    output = requests.get(url=url)
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(output.text, "html.parser")
+
+    # Remove unwanted tags (scripts, styles, nav, etc.)
+    for tag in soup(["script", "style", "header", "footer", "nav"]):
+        tag.extract()
+
+    page_text = soup.get_text(separator=" ", strip=True)
+    return page_text
+
 
 # --- Model and Tools Initialization ---
 main_llm = ChatOpenAI(model="gpt-4o")
 small_llm = ChatOpenAI(model="gpt-4o-mini")
-tools = [web_search]
+tools = [web_search, fetch_url_data]
 llm_with_tools = main_llm.bind_tools(tools)
 tool_node = ToolNode(tools)
 
@@ -80,13 +99,20 @@ def improve_input(state: State) -> dict:
     topic = state["topic"]
     prompt = improve_user_query.format(topic=topic)
     response = small_llm.invoke(prompt)
+    print(response.content)
 
     return {
-        "message": HumanMessage(content=response.content),
+        "messages": [HumanMessage(content=response.content)],
         "topic":response.content
     }
 
-    
+def summaries_text(text: str) -> str:
+    """
+    Takes text as an input summaries it and retuns the summary in less than 200 worda
+    """
+    prompt = summarize_text_query.format(text=text)
+    summary = small_llm.invoke(prompt)
+    return summary.content
 
 # --- Graph Nodes ---
 def agent(state: State) -> dict:
@@ -97,11 +123,24 @@ def agent(state: State) -> dict:
     messages = state["messages"]
     topic = state["topic"]
     feedback = state["feedback"]
+    tool_results = state["tool_results"]
 
     # Check for tool results in the message history
-    tool_results = "No data from tool yet. Use the web_search tool if you need current information."
-    if messages and isinstance(messages[-1], ToolMessage):
-        tool_results = messages[-1].content
+
+    if messages:
+        for msg in reversed(messages):
+            if isinstance(msg, ToolMessage):
+                tool_name = getattr(msg,"name", "")
+                content = summaries_text(msg.content)
+                if "fetch_url_data" in tool_name:
+                    tool_results = f"Primary URL content:\n{content}"
+                    search_snippets = [summaries_text(m.content) for m in messages 
+                                       if isinstance(m, ToolMessage) and "web_search" in getattr(m, "name", "") ]
+                    if search_snippets:
+                        tool_results += "\n\nOptional enrichment:\n" + "\n".join(search_snippets)
+                    break
+                elif "web_search" in tool_name and "Primary URL content" not in tool_results:
+                  tool_results = content
 
     # Format the prompt for the LLM
     prompt = linkedin_post_prompt.format(
@@ -117,6 +156,7 @@ def agent(state: State) -> dict:
     return {
         "messages": [response],
         "generated_post": response.content if response.content else "",
+        "tool_results": tool_results
     }
 
 
@@ -151,6 +191,18 @@ def post_to_linkedin(state: State) -> dict:
         print("---ACTION: Skipped posting as post was not approved.---")
     return {}
 
+def tools_condition_router(state: State):
+    if isinstance(state, list):
+        ai_message = state[-1]
+    elif isinstance(state, dict) and (messages := state.get("messages", [])):
+        ai_message = messages[-1]
+    elif messages := getattr(state, messages, []):
+        ai_message = messages[-1]
+    else:
+        raise ValueError(f"No messages found in input state to tool_edge: {state}")
+    if hasattr(ai_message, "tool_calls") and len(ai_message.tool_calls) > 0:
+        return ai_message.additional_kwargs["tool_calls"][0]['function']['name']
+    return "__end__"
 
 # --- Conditional Edges (Routers) ---
 def after_human_review(state: State) -> str:
@@ -225,6 +277,7 @@ def main():
         "messages": [HumanMessage(content=f"Initial topic: {topic}")],
         "topic": topic,
         "feedback": "No feedback yet.",
+        "tool_results": "No tools result"
     }
 
     while True:
